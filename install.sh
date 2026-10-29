@@ -7,6 +7,15 @@ BLUE='\033[0;34m'
 RED='\033[0;31m'
 NC='\033[0m' # No Color
 
+# The native host talks to MPRIS through GDBus, so it needs the GLib headers and
+# pkg-config to build.
+if ! command -v pkg-config >/dev/null 2>&1 || ! pkg-config --exists gio-2.0; then
+    echo -e "${RED}Missing build dependency: gio-2.0 (GLib development headers).${NC}"
+    echo "  Arch:          sudo pacman -S glib2"
+    echo "  Debian/Ubuntu: sudo apt install libglib2.0-dev"
+    exit 1
+fi
+
 # Configuration
 TARGET_DIR="$HOME/.config/youtube-mpris-fix"
 HOST_DIR="$HOME/.mozilla/native-messaging-hosts"
@@ -26,10 +35,14 @@ echo -e "${BLUE}Building native host...${NC}"
 # Note: The Makefile builds to 'native/mpris_volume_host'
 make host
 
-# Move compiled binary to the config directory
+# Move compiled binary to the config directory. Copy to a temporary name first:
+# the browser may still have the previous host running, and writing over a
+# running executable fails with "Text file busy". Renaming replaces the entry
+# and leaves the running process on its old inode.
 echo -e "${BLUE}Moving binary to $BINARY_PATH...${NC}"
-cp native/mpris_volume_host "$BINARY_PATH"
-chmod +x "$BINARY_PATH"
+cp native/mpris_volume_host "$BINARY_PATH.new"
+chmod +x "$BINARY_PATH.new"
+mv -f "$BINARY_PATH.new" "$BINARY_PATH"
 
 # 3. Update the manifest JSON with the new path
 echo -e "${BLUE}Updating manifest path in native/$MANIFEST_NAME...${NC}"

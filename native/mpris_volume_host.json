@@ -1,6 +1,6 @@
 {
   "name": "mpris_volume_host",
-  "description": "Writes YouTube slider volume to the browser's MPRIS Volume via playerctl.",
+  "description": "Keeps the YouTube slider and the browser's MPRIS Volume in sync without a feedback loop.",
   "path": "/home/Hi/.config/youtube-mpris-fix/mpris_volume_host",
   "type": "stdio",
   "allowed_extensions": [

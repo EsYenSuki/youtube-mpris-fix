@@ -26,6 +26,16 @@ YouTube is a Single-Page Application (SPA) that loads new videos dynamically wit
 
 On first frame loaded or PlaybackState 'play' we forcibly seek to the current position.
 
+*Volume sync (via native messaging).*
+
+The YouTube slider and MPRIS volume are mirrored both ways. The native host owns
+the MPRIS side: it polls the `Volume` property (Firefox/Zen never emit a change
+signal for it) and forwards only changes it did not make itself. Values are cut
+to three decimals (`0.526461` -> `0.526`) before they are applied or written, and
+a value MPRIS already holds is never written again. Because a host push is
+always an external change and a page change is always a new value, an echo can
+no longer bounce between YouTube and MPRIS.
+
 ---
 
 ## Installation:
@@ -34,14 +44,16 @@ On first frame loaded or PlaybackState 'play' we forcibly seek to the current po
 
 Since this extension uses native messaging to communicate with your system, you must install the host component:
 
-1.  Ensure you have `make` and `gcc` installed.
+1.  Install the build dependencies: `make`, `gcc`, `python3`, and the GLib/GIO
+    development headers (`glib2` on Arch, `libglib2.0-dev` on Debian/Ubuntu).
 2.  Clone this repository.
 3.  Run the installation script:
     ```bash
     chmod +x install.sh
     ./install.sh
     ```
-4.  **Restart your browser** for the changes to take effect.
+4.  **Restart your browser.** The browser starts the native host, so it must be
+    restarted after installing or rebuilding the host.
 
 ---
 

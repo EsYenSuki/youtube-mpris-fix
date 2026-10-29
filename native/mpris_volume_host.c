@@ -1,29 +1,59 @@
 /*
- * Native messaging host: receives YouTube's slider value (integer percent) from the
- * extension and writes it to the browser's MPRIS Volume as 0.xx via playerctl.
+ * Native messaging host: owns the browser's MPRIS Volume on behalf of the extension.
+ *
+ * Why this exists
+ * ---------------
+ * Firefox stores MPRIS Volume in its own variable and applies it to every media
+ * element when it is set. It never copies the page's volume back into that
+ * variable, and it emits no PropertiesChanged signal for Volume. Therefore the
+ * only way to notice an external volume change is to poll the property, and the
+ * only way to avoid a feedback loop is for one side to remember exactly which
+ * changes it caused.
+ *
+ * This host is that side. It polls MPRIS, pushes only changes it did not make,
+ * and refuses to write a value MPRIS already holds. The extension never has to
+ * guess whether an incoming value is its own echo.
  *
  * Protocol: 4-byte native-endian length prefix + UTF-8 JSON, in both directions.
- * Request:  {"volume": <integer 0..100>}
- * Reply:    {"ok": true, "player": "...", "volume": "0.xx", "skipped": bool}
- *           {"ok": false, "error": "..."}
  *
- * Build: cc -O2 -Wall -Wextra -o mpris_volume_host mpris_volume_host.c
+ * Extension -> host
+ *   {"type":"set","millis":<0..1000>}   set MPRIS volume, in thousandths
+ *   {"type":"get"}                      read the current MPRIS volume
+ *   {"millis":<0..1000>}                legacy form, same as "set"
+ *   {"volume":<0..100>}                 legacy form, percent
+ *
+ * Host -> extension (unsolicited, whenever MPRIS changes externally)
+ *   {"type":"volume","millis":<0..1000>}
+ *
+ * Replies
+ *   {"ok":true,"millis":N,"volume":"0.526","skipped":bool}
+ *   {"ok":false,"error":"..."}
+ *
+ * Build: cc -O2 -Wall -Wextra -std=c11 -D_DEFAULT_SOURCE \
+ *            $(pkg-config --cflags --libs gio-2.0) -o mpris_volume_host \
+ *            mpris_volume_host.c -lm
  */
 #define _POSIX_C_SOURCE 200809L
 
-#include <ctype.h>
 #include <errno.h>
-#include <fcntl.h>
 #include <math.h>
+#include <poll.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/wait.h>
 #include <unistd.h>
 
+#include <gio/gio.h>
+
 #define MAX_MSG (64 * 1024)
-#define PLAYER_MAX 256
+#define POLL_MS 200
+#define CALL_TIMEOUT_MS 500
+
+#define OBJECT_PATH "/org/mpris/MediaPlayer2"
+#define PLAYER_IFACE "org.mpris.MediaPlayer2.Player"
+#define PROPS_IFACE "org.freedesktop.DBus.Properties"
+#define MPRIS_PREFIX "org.mpris.MediaPlayer2."
 
 /* Read exactly n bytes; returns 0 on success, -1 on EOF/error. */
 static int read_full(void *buf, size_t n) {
@@ -54,74 +84,6 @@ static int send_json(const char *json) {
     uint32_t len = (uint32_t)strlen(json);
     if (write_full(&len, sizeof len) != 0) return -1;
     if (write_full(json, len) != 0) return -1;
-    return fflush(stdout) == 0 ? 0 : -1;
-}
-
-/* Runs argv with no shell. Captures stdout into out (NUL-terminated).
- * Returns the exit status, or -1 if the command could not run. */
-static int run_capture(char *const argv[], char *out, size_t outsz) {
-    int pipefd[2];
-    if (pipe(pipefd) != 0) return -1;
-    pid_t pid = fork();
-    if (pid < 0) {
-        close(pipefd[0]);
-        close(pipefd[1]);
-        return -1;
-    }
-    if (pid == 0) {
-        dup2(pipefd[1], STDOUT_FILENO);
-        close(pipefd[0]);
-        close(pipefd[1]);
-        int devnull = open("/dev/null", 2);
-        if (devnull >= 0) dup2(devnull, STDERR_FILENO);
-        execvp(argv[0], argv);
-        _exit(127);
-    }
-    close(pipefd[1]);
-    size_t used = 0;
-    for (;;) {
-        ssize_t r = read(pipefd[0], out + used, outsz - 1 - used);
-        if (r < 0 && errno == EINTR) continue;
-        if (r <= 0) break;
-        used += (size_t)r;
-        if (used >= outsz - 1) break;
-    }
-    out[used] = '\0';
-    close(pipefd[0]);
-    int status = 0;
-    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
-    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
-}
-
-/* Finds the first MPRIS player whose name starts with "firefox." (Zen uses firefox.instance_N). */
-static int find_player(char *player, size_t sz) {
-    char list[4096];
-    char *const argv[] = {"playerctl", "-l", NULL};
-    if (run_capture(argv, list, sizeof list) != 0) return -1;
-    char *save = NULL;
-    for (char *tok = strtok_r(list, "\n", &save); tok; tok = strtok_r(NULL, "\n", &save)) {
-        if (strncmp(tok, "firefox.", 8) == 0) {
-            snprintf(player, sz, "%s", tok);
-            return 0;
-        }
-    }
-    return -1;
-}
-
-/* Parses the JSON for an integer "volume" field, rejecting non-integers and out-of-range values. */
-static int parse_volume(const char *json, long *out) {
-    const char *key = strstr(json, "\"volume\"");
-    if (!key) return -1;
-    const char *p = key + strlen("\"volume\"");
-    while (*p == ' ' || *p == '\t' || *p == ':') p++;
-    if (*p == '\0' || (!isdigit((unsigned char)*p) && *p != '-')) return -1;
-    char *end;
-    errno = 0;
-    long v = strtol(p, &end, 10);
-    if (errno != 0 || end == p) return -1;
-    if (*end != ',' && *end != '}' && *end != ' ' && *end != '\0') return -1;
-    if (v < 0 || v > 100) return -1;
-    *out = v;
     return 0;
 }
 
@@ -131,59 +93,287 @@ static void reply_error(const char *msg) {
     send_json(buf);
 }
 
-static void handle_volume(long percent) {
-    char player[PLAYER_MAX];
-    if (find_player(player, sizeof player) != 0) {
-        reply_error("no firefox MPRIS player");
-        return;
+/* Volume 0..1 to thousandths, cutting the noisy decimals. The epsilon handles
+ * binary float error (0.29 * 1000 == 289.999...). */
+static long volume_to_millis(double volume) {
+    if (!(volume > 0.0)) return 0; /* also catches NaN */
+    if (volume > 1.0) volume = 1.0;
+    long millis = (long)floor(volume * 1000.0 + 1e-6);
+    if (millis < 0) millis = 0;
+    if (millis > 1000) millis = 1000;
+    return millis;
+}
+
+static GDBusConnection *bus;
+static char *player;
+static long last_millis;
+static int have_last;
+
+static int ensure_bus(void) {
+    if (bus) return 0;
+    GError *error = NULL;
+    bus = g_bus_get_sync(G_BUS_TYPE_SESSION, NULL, &error);
+    if (!bus) {
+        g_clear_error(&error);
+        return -1;
+    }
+    return 0;
+}
+
+static int is_browser_player(const char *name) {
+    size_t prefix = strlen(MPRIS_PREFIX);
+    if (strncmp(name, MPRIS_PREFIX, prefix) != 0) return 0;
+    const char *instance = name + prefix;
+    /* Zen and forks report themselves as firefox.instance_N. */
+    return strncmp(instance, "firefox.", 8) == 0 ||
+           strncmp(instance, "zen.", 4) == 0 ||
+           strncmp(instance, "librewolf.", 10) == 0;
+}
+
+/* Finds the first browser MPRIS player. Names look like
+ * org.mpris.MediaPlayer2.firefox.instance_1_253. */
+static char *find_player(void) {
+    GError *error = NULL;
+    GVariant *names = g_dbus_connection_call_sync(
+        bus, "org.freedesktop.DBus", "/org/freedesktop/DBus",
+        "org.freedesktop.DBus", "ListNames", NULL, G_VARIANT_TYPE("(as)"),
+        G_DBUS_CALL_FLAGS_NONE, CALL_TIMEOUT_MS, NULL, &error);
+    if (!names) {
+        g_clear_error(&error);
+        return NULL;
     }
 
-    char target[8];
-    snprintf(target, sizeof target, "%.2f", (double)percent / 100.0);
-
-    /* Skip the write when MPRIS already holds this value. */
-    char cur[64];
-    char *const get[] = {"playerctl", "-p", player, "volume", NULL};
-    if (run_capture(get, cur, sizeof cur) == 0) {
-        double c = strtod(cur, NULL);
-        if (fabs(c - (double)percent / 100.0) < 0.005) {
-            char buf[512];
-            snprintf(buf, sizeof buf,
-                     "{\"ok\":true,\"player\":\"%s\",\"volume\":\"%s\",\"skipped\":true}",
-                     player, target);
-            send_json(buf);
-            return;
+    char *found = NULL;
+    GVariantIter *iter;
+    const char *name;
+    g_variant_get(names, "(as)", &iter);
+    while (g_variant_iter_next(iter, "&s", &name)) {
+        if (is_browser_player(name)) {
+            found = g_strdup(name);
+            break;
         }
     }
+    g_variant_iter_free(iter);
+    g_variant_unref(names);
+    return found;
+}
 
-    char discard[64];
-    char *const set[] = {"playerctl", "-p", player, "volume", target, NULL};
-    if (run_capture(set, discard, sizeof discard) != 0) {
-        reply_error("playerctl volume write failed");
+static int get_volume(const char *dest, double *out) {
+    GError *error = NULL;
+    GVariant *reply = g_dbus_connection_call_sync(
+        bus, dest, OBJECT_PATH, PROPS_IFACE, "Get",
+        g_variant_new("(ss)", PLAYER_IFACE, "Volume"), G_VARIANT_TYPE("(v)"),
+        G_DBUS_CALL_FLAGS_NONE, CALL_TIMEOUT_MS, NULL, &error);
+    if (!reply) {
+        g_clear_error(&error);
+        return -1;
+    }
+
+    GVariant *value = NULL;
+    g_variant_get(reply, "(v)", &value);
+    int ok = 0;
+    if (value && g_variant_is_of_type(value, G_VARIANT_TYPE_DOUBLE)) {
+        *out = g_variant_get_double(value);
+        ok = 1;
+    }
+    if (value) g_variant_unref(value);
+    g_variant_unref(reply);
+    return ok ? 0 : -1;
+}
+
+static int set_volume(const char *dest, double volume) {
+    GError *error = NULL;
+    GVariant *reply = g_dbus_connection_call_sync(
+        bus, dest, OBJECT_PATH, PROPS_IFACE, "Set",
+        g_variant_new("(ssv)", PLAYER_IFACE, "Volume",
+                      g_variant_new_double(volume)),
+        NULL, G_DBUS_CALL_FLAGS_NONE, CALL_TIMEOUT_MS, NULL, &error);
+    if (!reply) {
+        g_clear_error(&error);
+        return -1;
+    }
+    g_variant_unref(reply);
+    return 0;
+}
+
+/* Reads the live MPRIS volume, re-resolving the player when it goes away. */
+static int read_current(long *out) {
+    if (ensure_bus() != 0) return -1;
+    for (int attempt = 0; attempt < 2; attempt++) {
+        if (player) {
+            double volume;
+            if (get_volume(player, &volume) == 0) {
+                *out = volume_to_millis(volume);
+                return 0;
+            }
+            g_free(player);
+            player = NULL;
+        }
+        player = find_player();
+        if (!player) return -1;
+    }
+    return -1;
+}
+
+/* Polls MPRIS and pushes any change we did not make. Our own writes update
+ * last_millis first, so they are never reported back to the extension. */
+static void watch_volume(void) {
+    long millis;
+    if (read_current(&millis) != 0) {
+        have_last = 0; /* player gone; re-baseline when it returns */
         return;
     }
-    char buf[512];
-    snprintf(buf, sizeof buf,
-             "{\"ok\":true,\"player\":\"%s\",\"volume\":\"%s\",\"skipped\":false}",
-             player, target);
+    if (!have_last) {
+        last_millis = millis;
+        have_last = 1;
+        return;
+    }
+    if (millis == last_millis) return;
+    last_millis = millis;
+    char buf[64];
+    snprintf(buf, sizeof buf, "{\"type\":\"volume\",\"millis\":%ld}", millis);
     send_json(buf);
+}
+
+static void handle_set(long millis) {
+    long current;
+    if (read_current(&current) != 0) {
+        reply_error("no browser MPRIS player");
+        return;
+    }
+
+    int skipped = current == millis;
+    if (!skipped && set_volume(player, (double)millis / 1000.0) != 0) {
+        reply_error("MPRIS volume write failed");
+        return;
+    }
+
+    last_millis = millis;
+    have_last = 1;
+
+    char buf[256];
+    snprintf(buf, sizeof buf,
+             "{\"ok\":true,\"millis\":%ld,\"volume\":\"%.3f\",\"skipped\":%s}",
+             millis, (double)millis / 1000.0, skipped ? "true" : "false");
+    send_json(buf);
+}
+
+static void handle_get(void) {
+    long millis;
+    if (read_current(&millis) != 0) {
+        reply_error("no browser MPRIS player");
+        return;
+    }
+    if (!have_last) {
+        last_millis = millis;
+        have_last = 1;
+    }
+    char buf[128];
+    snprintf(buf, sizeof buf,
+             "{\"ok\":true,\"millis\":%ld,\"volume\":\"%.3f\"}", millis,
+             (double)millis / 1000.0);
+    send_json(buf);
+}
+
+static int parse_long_field(const char *json, const char *key, long *out) {
+    const char *found = strstr(json, key);
+    if (!found) return -1;
+    const char *p = found + strlen(key);
+    while (*p == ' ' || *p == '\t' || *p == ':') p++;
+    if (*p == '\0' || ((*p < '0' || *p > '9') && *p != '-')) return -1;
+    char *end;
+    errno = 0;
+    long value = strtol(p, &end, 10);
+    if (errno != 0 || end == p) return -1;
+    if (*end != ',' && *end != '}' && *end != ' ' && *end != '\t' && *end != '\0')
+        return -1;
+    *out = value;
+    return 0;
+}
+
+static int parse_type(const char *json, char *out, size_t out_size) {
+    const char *found = strstr(json, "\"type\"");
+    if (!found) return -1;
+    const char *p = found + strlen("\"type\"");
+    while (*p == ' ' || *p == '\t' || *p == ':') p++;
+    if (*p != '"') return -1;
+    p++;
+    size_t used = 0;
+    while (*p && *p != '"' && used + 1 < out_size) out[used++] = *p++;
+    out[used] = '\0';
+    return 0;
+}
+
+static void handle_message(const char *json) {
+    char type[16];
+    if (parse_type(json, type, sizeof type) == 0) {
+        if (strcmp(type, "get") == 0) {
+            handle_get();
+            return;
+        }
+        if (strcmp(type, "set") == 0) {
+            long millis;
+            if (parse_long_field(json, "\"millis\"", &millis) != 0 ||
+                millis < 0 || millis > 1000) {
+                reply_error("millis must be an integer 0..1000");
+                return;
+            }
+            handle_set(millis);
+            return;
+        }
+        reply_error("unknown request type");
+        return;
+    }
+
+    /* Legacy requests from older extension versions. */
+    long millis;
+    if (parse_long_field(json, "\"millis\"", &millis) == 0) {
+        if (millis < 0 || millis > 1000) {
+            reply_error("millis must be an integer 0..1000");
+            return;
+        }
+        handle_set(millis);
+        return;
+    }
+
+    long percent;
+    if (parse_long_field(json, "\"volume\"", &percent) == 0) {
+        if (percent < 0 || percent > 100) {
+            reply_error("volume must be an integer 0..100");
+            return;
+        }
+        handle_set(percent * 10);
+        return;
+    }
+
+    reply_error("expected {\"type\":\"set\",\"millis\":N}");
 }
 
 int main(void) {
     static char msg[MAX_MSG + 1];
-    for (;;) {
-        uint32_t len;
-        if (read_full(&len, sizeof len) != 0) break;
-        if (len == 0 || len > MAX_MSG) break; /* browsers cap messages; treat as protocol error */
-        if (read_full(msg, len) != 0) break;
-        msg[len] = '\0';
+    struct pollfd stdin_poll = {STDIN_FILENO, POLLIN, 0};
 
-        long percent;
-        if (parse_volume(msg, &percent) != 0) {
-            reply_error("volume must be an integer 0..100");
-            continue;
+    for (;;) {
+        int ready = poll(&stdin_poll, 1, POLL_MS);
+        if (ready < 0) {
+            if (errno == EINTR) continue;
+            break;
         }
-        handle_volume(percent);
+        if (ready > 0 &&
+            (stdin_poll.revents & (POLLIN | POLLHUP | POLLERR))) {
+            uint32_t len;
+            if (read_full(&len, sizeof len) != 0) break;
+            if (len == 0 || len > MAX_MSG) break;
+            if (read_full(msg, len) != 0) break;
+            msg[len] = '\0';
+            handle_message(msg);
+        }
+        /* Also runs right after a message, which keeps last_millis in sync
+         * with what we just wrote. */
+        watch_volume();
     }
+
+    g_free(player);
+    if (bus) g_object_unref(bus);
     return 0;
 }
