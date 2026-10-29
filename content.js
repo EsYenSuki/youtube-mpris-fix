@@ -10,7 +10,7 @@
 //                  animation settles into one value, then write that value.
 //
 // On top of that, the host refuses to write a value MPRIS already holds, and a
-// short lock after applying a host value ignores the volumechange events that
+// short lock after applying a host value ignores the onVolumeChange events that
 // Firefox itself produces while applying it. Together those two rules are what
 // stop the old YouTube -> MPRIS -> YouTube echo.
 const VOLUME_EVENT = 'ytmpris-set-volume';
@@ -43,6 +43,22 @@ function percentToMillis(percent) {
 // Runs in the page's JS world, where movie_player is reachable.
 function pageVolumeBridge() {
   const REPORT = 'ytmpris-volume-report';
+  // The logical slider volume. Do not read the media element: YouTube applies
+  // loudness normalization to it, so a 5% slider can make video.volume 0.026.
+  function readPercent(player) {
+    if (player && typeof player.getVolume === 'function') {
+      const v = Number(player.getVolume());
+      if (Number.isFinite(v)) return v;
+    }
+    const panel = document.querySelector('.ytp-volume-panel[aria-valuenow]');
+    if (!panel || typeof panel.getAttribute !== 'function') return null;
+    const v = parseFloat(panel.getAttribute('aria-valuenow'));
+    return Number.isFinite(v) ? v : null;
+  }
+  function report(player) {
+    const v = readPercent(player);
+    if (v !== null) window.dispatchEvent(new CustomEvent(REPORT, { detail: v }));
+  }
   window.addEventListener('ytmpris-set-volume', (e) => {
     const player = document.getElementById('movie_player');
     if (!player || typeof player.setVolume !== 'function') return;
@@ -59,12 +75,7 @@ function pageVolumeBridge() {
     const player = document.getElementById('movie_player');
     if (!player || player.__ytmprisHooked || typeof player.addEventListener !== 'function') return;
     player.__ytmprisHooked = true;
-    player.addEventListener('onVolumeChange', (data) => {
-      const v = data && typeof data.volume === 'number'
-        ? data.volume
-        : (typeof player.getVolume === 'function' ? player.getVolume() : null);
-      if (v !== null) window.dispatchEvent(new CustomEvent(REPORT, { detail: v }));
-    });
+    player.addEventListener('onVolumeChange', () => report(player));
   }
   window.addEventListener('ytmpris-attach', hook);
   hook();
@@ -157,7 +168,6 @@ new MutationObserver(() => {
     // That means the MPRIS position will continue counting even when paused
     // play will forecably align the position when Playback state play occurs
     vid.addEventListener('play', () => vid.currentTime = vid.currentTime);
-    vid.addEventListener('volumechange', () => onPageVolume(vid.volume * 100));
   }
   // Attach the YouTube volume hook even before any MPRIS event arrives.
   ensureBridge();

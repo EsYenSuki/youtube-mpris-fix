@@ -30,11 +30,13 @@ On first frame loaded or PlaybackState 'play' we forcibly seek to the current po
 
 The YouTube slider and MPRIS volume are mirrored both ways. The native host owns
 the MPRIS side: it polls the `Volume` property (Firefox/Zen never emit a change
-signal for it) and forwards only changes it did not make itself. Values are cut
-to three decimals (`0.526461` -> `0.526`) before they are applied or written, and
-a value MPRIS already holds is never written again. Because a host push is
-always an external change and a page change is always a new value, an echo can
-no longer bounce between YouTube and MPRIS.
+signal for it) and forwards only changes it did not make itself. The extension
+reports the slider's logical volume (`movie_player.getVolume()`), not the media
+element's volume, which YouTube may scale for loudness normalization or Stable
+Volume. Values are cut to three decimals (`0.526461` -> `0.526`) before they are
+applied or written, and a value MPRIS already holds is never written again.
+Because a host push is always an external change and a page change is always a
+new value, an echo can no longer bounce between YouTube and MPRIS.
 
 ---
 

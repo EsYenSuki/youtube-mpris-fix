@@ -142,6 +142,14 @@ def main():
           len(replies) == 1 and replies[0].get('skipped') is True)
     check('no second write', state['writes'] == ['0.370'])
 
+    # A 5% YouTube slider arrives as 50 millis and must stay 0.050.
+    send({'type': 'set', 'millis': 50})
+    replies = read_messages(1.0)
+    check('5% is written as 0.050',
+          len(replies) == 1 and replies[0].get('ok')
+          and replies[0].get('volume') == '0.050')
+    check('mock player received 0.050', state['writes'] == ['0.370', '0.050'])
+
     # Simulate another application changing MPRIS directly.
     state['volume'] = 0.412345
     replies = read_messages(1.5)
