@@ -30,22 +30,33 @@ On first frame loaded or PlaybackState 'play' we forcibly seek to the current po
 
 ## Installation:
 
-### Firefox
+### 1. Native Messaging Host (Required for Firefox/Zen)
 
-Firefox Add-Ons: [YouTube MPRIS](https://addons.mozilla.org/en-US/firefox/addon/youtube-mpris)
+Since this extension uses native messaging to communicate with your system, you must install the host component:
 
-### Chromium
+1.  Ensure you have `make` and `gcc` installed.
+2.  Clone this repository.
+3.  Run the installation script:
+    ```bash
+    chmod +x install.sh
+    ./install.sh
+    ```
+4.  **Restart your browser** for the changes to take effect.
 
-1. Clone or download this repository.
+---
 
-3. Open browser and go to `chrome://extensions` (or `yourbrowser://extensions`).
+### 2. Browser Extension
 
-4. Toggle "Developer mode" on.
+#### Firefox / Zen / Librewolf
+1.  Open Firefox and go to `about:debugging#/runtime/this-firefox`.
+2.  Click **"Load Temporary Add-on..."**.
+3.  Select the `manifest.json` file from this repository.
+    *   *Note: For permanent installation, please download from the [Firefox Add-Ons store](https://addons.mozilla.org/en-US/firefox/addon/youtube-mpris).*
 
-5. Click "Load unpacked".
+#### Chromium (Chrome, Brave, Edge, etc.)
+1.  Open browser and go to `chrome://extensions` (or `yourbrowser://extensions`).
+2.  Toggle **"Developer mode"** on.
+3.  Click **"Load unpacked"**.
+4.  Select the extension directory (the folder that contains `manifest.json`).
+5.  The extension should appear in the extensions list; reload the extension if you make alterations.
 
-6. Select the extension directory (the folder that contains `manifest.json`).
-
-7. The extension should appear in the extensions list; reload the extension if you make alterations.
-
- ---
