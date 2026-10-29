@@ -8,13 +8,10 @@ host: native/mpris_volume_host
 native/mpris_volume_host: native/mpris_volume_host.c
 	$(CC) -O2 -Wall -Wextra -Werror -std=c11 -D_DEFAULT_SOURCE -o $@ $< -lm
 
-# Installs the native host manifest where Zen/Firefox look for it.
+# Installs the native host manifest where Firefox/Zen look for it.
 install-host: host
 	mkdir -p $(HOME)/.mozilla/native-messaging-hosts
 	cp native/mpris_volume_host.json $(HOME)/.mozilla/native-messaging-hosts/
-	# Also install for Zen/Firefox if using different paths (optional/extra)
-	mkdir -p $(HOME)/.zen/native-messaging-hosts || true
-	cp native/mpris_volume_host.json $(HOME)/.zen/native-messaging-hosts/ || true
 
 
 test-host: host
