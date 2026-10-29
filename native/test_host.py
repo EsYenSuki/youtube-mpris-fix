@@ -58,7 +58,7 @@ def main():
         None, None)
     info = Gio.DBusNodeInfo.new_for_xml(XML).interfaces[0]
 
-    state = {'volume': 0.175992, 'writes': []}
+    state = {'volume': 0.175992, 'writes': [], 'round_to': None}
 
     def on_method(conn, sender, path, iface, method, params, invocation):
         invocation.return_error_literal(
@@ -74,8 +74,11 @@ def main():
     def on_set(conn, sender, path, iface, prop, value, *args):
         if prop != 'Volume':
             raise GLib.Error('unknown property ' + prop)
-        state['volume'] = value.unpack()
-        state['writes'].append(f'{state["volume"]:.3f}')
+        volume = value.unpack()
+        if state['round_to'] is not None:
+            volume = round(volume, state['round_to'])
+        state['volume'] = volume
+        state['writes'].append(volume)
         return True
 
     registration = conn.register_object(
@@ -119,48 +122,61 @@ def main():
     def check(name, condition):
         checks.append((name, bool(condition)))
 
+    def near(value, expected, tolerance=1e-9):
+        return isinstance(value, (int, float)) and abs(value - expected) <= tolerance
+
     # Establish the baseline: the host must not report the starting volume.
     check('startup volume is not pushed', read_messages(0.6) == [])
 
     send({'type': 'get'})
     replies = read_messages(1.0)
-    check('get returns the cut volume',
-          len(replies) == 1 and replies[0].get('millis') == 175)
+    check('get returns the exact volume',
+          len(replies) == 1 and near(replies[0].get('volume'), 0.175992)
+          and replies[0].get('millis') == 175)
 
-    send({'type': 'set', 'millis': 370})
+    send({'type': 'set', 'volume': 0.526461})
     replies = read_messages(1.0)
-    check('set writes 0.370',
+    check('set writes the exact volume',
           len(replies) == 1 and replies[0].get('ok')
           and replies[0].get('skipped') is False
-          and replies[0].get('volume') == '0.370')
-    check('mock player received 0.370', state['writes'] == ['0.370'])
+          and near(replies[0].get('volume'), 0.526461))
+    check('mock player received 0.526461',
+          len(state['writes']) == 1 and near(state['writes'][0], 0.526461))
     check('own write is not pushed back', read_messages(0.6) == [])
 
-    send({'type': 'set', 'millis': 370})
+    send({'type': 'set', 'volume': 0.526461})
     replies = read_messages(1.0)
     check('same value is skipped',
           len(replies) == 1 and replies[0].get('skipped') is True)
-    check('no second write', state['writes'] == ['0.370'])
+    check('no second write', len(state['writes']) == 1)
 
-    # A 5% YouTube slider arrives as 50 millis and must stay 0.050.
-    send({'type': 'set', 'millis': 50})
+    # A 5% YouTube slider must stay 0.05, not become 0.026 or 0.050.
+    send({'type': 'set', 'volume': 0.05})
     replies = read_messages(1.0)
-    check('5% is written as 0.050',
+    check('5% is written as 0.05',
           len(replies) == 1 and replies[0].get('ok')
-          and replies[0].get('volume') == '0.050')
-    check('mock player received 0.050', state['writes'] == ['0.370', '0.050'])
+          and near(replies[0].get('volume'), 0.05)
+          and replies[0].get('millis') == 50)
+    check('mock player received 0.05',
+          len(state['writes']) == 2 and near(state['writes'][1], 0.05))
 
     # Simulate another application changing MPRIS directly.
     state['volume'] = 0.412345
     replies = read_messages(1.5)
     check('external change is pushed',
-          any(r.get('type') == 'volume' and r.get('millis') == 412
-              for r in replies))
+          any(r.get('type') == 'volume' and near(r.get('volume'), 0.412345)
+              and r.get('millis') == 412 for r in replies))
 
     send({'type': 'get'})
     replies = read_messages(1.0)
     check('get sees the external change',
-          any(r.get('ok') and r.get('millis') == 412 for r in replies))
+          any(r.get('ok') and near(r.get('volume'), 0.412345)
+              for r in replies))
+
+    send({'type': 'set', 'volume': 1.001})
+    replies = read_messages(0.5)
+    check('volume above 1 is rejected',
+          any(r.get('ok') is False for r in replies))
 
     send({'type': 'set', 'millis': 1001})
     replies = read_messages(0.5)
@@ -175,13 +191,25 @@ def main():
     # Legacy request shapes from older extension versions.
     send({'volume': 42})
     replies = read_messages(1.0)
-    check('legacy percent is written as 0.420',
-          any(r.get('ok') and r.get('volume') == '0.420' for r in replies))
+    check('legacy percent is written as 0.42',
+          any(r.get('ok') and near(r.get('volume'), 0.42) for r in replies))
 
     send({'millis': 999})
     replies = read_messages(1.0)
     check('legacy millis is written as 0.999',
-          any(r.get('ok') and r.get('volume') == '0.999' for r in replies))
+          any(r.get('ok') and near(r.get('volume'), 0.999) for r in replies))
+
+    # If Firefox rounds the stored value, the read-back must suppress the echo.
+    state['round_to'] = 3
+    send({'type': 'set', 'volume': 0.526461})
+    replies = read_messages(1.0)
+    check('rounded read-back is acknowledged',
+          len(replies) == 1 and replies[0].get('ok')
+          and near(replies[0].get('volume'), 0.526))
+    check('rounded own write is not pushed back', read_messages(0.6) == [])
+    check('mock player rounded the stored volume',
+          near(state['volume'], 0.526))
+    state['round_to'] = None
 
     proc.stdin.close()
     check('exit code is 0', proc.wait(timeout=5) == 0)

@@ -33,10 +33,17 @@ the MPRIS side: it polls the `Volume` property (Firefox/Zen never emit a change
 signal for it) and forwards only changes it did not make itself. The extension
 reports the slider's logical volume (`movie_player.getVolume()`), not the media
 element's volume, which YouTube may scale for loudness normalization or Stable
-Volume. Values are cut to three decimals (`0.526461` -> `0.526`) before they are
-applied or written, and a value MPRIS already holds is never written again.
-Because a host push is always an external change and a page change is always a
-new value, an echo can no longer bounce between YouTube and MPRIS.
+Volume. When MPRIS changes, the page bridge sets the slider and *pins the media
+element to the same logical level*, so the element and MPRIS can never play on
+different scales (which used to cause a 1ms volume blip on every change). If
+neither `getVolume()` nor the slider's `aria-valuenow` is reachable, the element
+value is converted back through a learned scale (`video.volume 0.026 -> 5%`).
+Volume is carried as a full normalized double (`0.526461`), not cut to
+three decimals. The host remembers the value MPRIS actually stored and compares
+with a tiny tolerance, so rounding or float noise cannot echo back. A value MPRIS
+already holds is never written again. Because a host push is always an external
+change and a page change is always a new value, an echo cannot bounce between
+YouTube and MPRIS.
 
 ---
 

@@ -17,17 +17,20 @@
  * Protocol: 4-byte native-endian length prefix + UTF-8 JSON, in both directions.
  *
  * Extension -> host
- *   {"type":"set","millis":<0..1000>}   set MPRIS volume, in thousandths
+ *   {"type":"set","volume":<0..1>}      set MPRIS volume, full double precision
  *   {"type":"get"}                      read the current MPRIS volume
  *   {"millis":<0..1000>}                legacy form, same as "set"
  *   {"volume":<0..100>}                 legacy form, percent
  *
  * Host -> extension (unsolicited, whenever MPRIS changes externally)
- *   {"type":"volume","millis":<0..1000>}
+ *   {"type":"volume","volume":<0..1>,"millis":<0..1000>}
  *
  * Replies
- *   {"ok":true,"millis":N,"volume":"0.526","skipped":bool}
+ *   {"ok":true,"volume":<0..1>,"millis":N,"skipped":bool}
  *   {"ok":false,"error":"..."}
+ *
+ * The millis field is retained only for older extension versions. The current
+ * extension uses volume, so no decimal places are cut on the wire.
  *
  * Build: cc -O2 -Wall -Wextra -std=c11 -D_DEFAULT_SOURCE \
  *            $(pkg-config --cflags --libs gio-2.0) -o mpris_volume_host \
@@ -49,6 +52,8 @@
 #define MAX_MSG (64 * 1024)
 #define POLL_MS 200
 #define CALL_TIMEOUT_MS 500
+/* Small enough to preserve real changes, large enough for double round-trips. */
+#define VOLUME_EPS 1e-9
 
 #define OBJECT_PATH "/org/mpris/MediaPlayer2"
 #define PLAYER_IFACE "org.mpris.MediaPlayer2.Player"
@@ -93,8 +98,8 @@ static void reply_error(const char *msg) {
     send_json(buf);
 }
 
-/* Volume 0..1 to thousandths, cutting the noisy decimals. The epsilon handles
- * binary float error (0.29 * 1000 == 289.999...). */
+/* Legacy millis field for older extension versions. The volume itself is never
+ * quantized. The epsilon handles binary float error (0.29 * 1000 == 289.999...). */
 static long volume_to_millis(double volume) {
     if (!(volume > 0.0)) return 0; /* also catches NaN */
     if (volume > 1.0) volume = 1.0;
@@ -106,7 +111,7 @@ static long volume_to_millis(double volume) {
 
 static GDBusConnection *bus;
 static char *player;
-static long last_millis;
+static double last_volume;
 static int have_last;
 
 static int ensure_bus(void) {
@@ -173,8 +178,11 @@ static int get_volume(const char *dest, double *out) {
     g_variant_get(reply, "(v)", &value);
     int ok = 0;
     if (value && g_variant_is_of_type(value, G_VARIANT_TYPE_DOUBLE)) {
-        *out = g_variant_get_double(value);
-        ok = 1;
+        double volume = g_variant_get_double(value);
+        if (isfinite(volume)) {
+            *out = volume;
+            ok = 1;
+        }
     }
     if (value) g_variant_unref(value);
     g_variant_unref(reply);
@@ -197,13 +205,13 @@ static int set_volume(const char *dest, double volume) {
 }
 
 /* Reads the live MPRIS volume, re-resolving the player when it goes away. */
-static int read_current(long *out) {
+static int read_current(double *out) {
     if (ensure_bus() != 0) return -1;
     for (int attempt = 0; attempt < 2; attempt++) {
         if (player) {
             double volume;
             if (get_volume(player, &volume) == 0) {
-                *out = volume_to_millis(volume);
+                *out = volume;
                 return 0;
             }
             g_free(player);
@@ -216,62 +224,78 @@ static int read_current(long *out) {
 }
 
 /* Polls MPRIS and pushes any change we did not make. Our own writes update
- * last_millis first, so they are never reported back to the extension. */
+ * last_volume first, so they are never reported back to the extension. */
 static void watch_volume(void) {
-    long millis;
-    if (read_current(&millis) != 0) {
+    double volume;
+    if (read_current(&volume) != 0) {
         have_last = 0; /* player gone; re-baseline when it returns */
         return;
     }
     if (!have_last) {
-        last_millis = millis;
+        last_volume = volume;
         have_last = 1;
         return;
     }
-    if (millis == last_millis) return;
-    last_millis = millis;
-    char buf[64];
-    snprintf(buf, sizeof buf, "{\"type\":\"volume\",\"millis\":%ld}", millis);
+    if (fabs(volume - last_volume) <= VOLUME_EPS) return;
+    last_volume = volume;
+    char buf[160];
+    snprintf(buf, sizeof buf,
+             "{\"type\":\"volume\",\"volume\":%.17g,\"millis\":%ld}",
+             volume, volume_to_millis(volume));
     send_json(buf);
 }
 
-static void handle_set(long millis) {
-    long current;
+static void handle_set(double volume) {
+    if (!isfinite(volume)) {
+        reply_error("volume must be a finite number 0..1");
+        return;
+    }
+    if (volume < 0.0) volume = 0.0;
+    if (volume > 1.0) volume = 1.0;
+
+    double current;
     if (read_current(&current) != 0) {
         reply_error("no browser MPRIS player");
         return;
     }
 
-    int skipped = current == millis;
-    if (!skipped && set_volume(player, (double)millis / 1000.0) != 0) {
+    int skipped = fabs(current - volume) <= VOLUME_EPS;
+    if (!skipped && set_volume(player, volume) != 0) {
         reply_error("MPRIS volume write failed");
         return;
     }
 
-    last_millis = millis;
+    /* Remember what MPRIS actually stored. If Firefox rounds the value, the
+     * poll below must compare against the rounded value, not the request. */
+    double actual = skipped ? current : volume;
+    if (!skipped) {
+        double seen;
+        if (read_current(&seen) == 0) actual = seen;
+    }
+    last_volume = actual;
     have_last = 1;
 
     char buf[256];
     snprintf(buf, sizeof buf,
-             "{\"ok\":true,\"millis\":%ld,\"volume\":\"%.3f\",\"skipped\":%s}",
-             millis, (double)millis / 1000.0, skipped ? "true" : "false");
+             "{\"ok\":true,\"volume\":%.17g,\"millis\":%ld,\"skipped\":%s}",
+             actual, volume_to_millis(actual), skipped ? "true" : "false");
     send_json(buf);
 }
 
 static void handle_get(void) {
-    long millis;
-    if (read_current(&millis) != 0) {
+    double volume;
+    if (read_current(&volume) != 0) {
         reply_error("no browser MPRIS player");
         return;
     }
     if (!have_last) {
-        last_millis = millis;
+        last_volume = volume;
         have_last = 1;
     }
-    char buf[128];
+    char buf[160];
     snprintf(buf, sizeof buf,
-             "{\"ok\":true,\"millis\":%ld,\"volume\":\"%.3f\"}", millis,
-             (double)millis / 1000.0);
+             "{\"ok\":true,\"volume\":%.17g,\"millis\":%ld}", volume,
+             volume_to_millis(volume));
     send_json(buf);
 }
 
@@ -285,6 +309,22 @@ static int parse_long_field(const char *json, const char *key, long *out) {
     errno = 0;
     long value = strtol(p, &end, 10);
     if (errno != 0 || end == p) return -1;
+    if (*end != ',' && *end != '}' && *end != ' ' && *end != '\t' && *end != '\0')
+        return -1;
+    *out = value;
+    return 0;
+}
+
+static int parse_double_field(const char *json, const char *key, double *out) {
+    const char *found = strstr(json, key);
+    if (!found) return -1;
+    const char *p = found + strlen(key);
+    while (*p == ' ' || *p == '\t' || *p == ':') p++;
+    if (*p == '\0' || *p == '"') return -1;
+    char *end;
+    errno = 0;
+    double value = strtod(p, &end);
+    if (errno != 0 || end == p || !isfinite(value)) return -1;
     if (*end != ',' && *end != '}' && *end != ' ' && *end != '\t' && *end != '\0')
         return -1;
     *out = value;
@@ -312,13 +352,22 @@ static void handle_message(const char *json) {
             return;
         }
         if (strcmp(type, "set") == 0) {
-            long millis;
-            if (parse_long_field(json, "\"millis\"", &millis) != 0 ||
-                millis < 0 || millis > 1000) {
-                reply_error("millis must be an integer 0..1000");
+            double volume;
+            if (parse_double_field(json, "\"volume\"", &volume) == 0) {
+                if (volume < 0.0 || volume > 1.0) {
+                    reply_error("volume must be a number 0..1");
+                    return;
+                }
+                handle_set(volume);
                 return;
             }
-            handle_set(millis);
+            long millis;
+            if (parse_long_field(json, "\"millis\"", &millis) == 0 &&
+                millis >= 0 && millis <= 1000) {
+                handle_set((double)millis / 1000.0);
+                return;
+            }
+            reply_error("expected volume 0..1 or millis 0..1000");
             return;
         }
         reply_error("unknown request type");
@@ -332,7 +381,7 @@ static void handle_message(const char *json) {
             reply_error("millis must be an integer 0..1000");
             return;
         }
-        handle_set(millis);
+        handle_set((double)millis / 1000.0);
         return;
     }
 
@@ -342,11 +391,11 @@ static void handle_message(const char *json) {
             reply_error("volume must be an integer 0..100");
             return;
         }
-        handle_set(percent * 10);
+        handle_set((double)percent / 100.0);
         return;
     }
 
-    reply_error("expected {\"type\":\"set\",\"millis\":N}");
+    reply_error("expected {\"type\":\"set\",\"volume\":V}");
 }
 
 int main(void) {
@@ -368,7 +417,7 @@ int main(void) {
             msg[len] = '\0';
             handle_message(msg);
         }
-        /* Also runs right after a message, which keeps last_millis in sync
+        /* Also runs right after a message, which keeps last_volume in sync
          * with what we just wrote. */
         watch_volume();
     }

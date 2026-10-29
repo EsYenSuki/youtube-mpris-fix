@@ -17,59 +17,120 @@ const VOLUME_EVENT = 'ytmpris-set-volume';
 const api = typeof browser !== 'undefined' ? browser : (typeof chrome !== 'undefined' ? chrome : null);
 const SEND_DELAY_MS = 150; // let a drag or a volume animation settle
 const APPLY_LOCK_MS = 400; // ignore page events caused by applying a host value
+const VOLUME_EPS = 1e-6; // ignore float noise, not real volume changes
 
 let bridgeInjected = false;
 let adopted = false;
-let expected = null; // millis last applied from the host or sent to it
+let expected = null; // normalized volume last applied from the host or sent to it
 let lockUntil = 0;
 let sendTimer = null;
 let pending = null;
 
-// Volume (0..1) as thousandths, cutting the noisy decimals.
-// The epsilon compensates for binary float error (0.29 * 1000 = 289.999...).
-function volumeToMillis(volume) {
+// Volume normalized to 0..1 without cutting decimals.
+function normalizeVolume(volume) {
+  if (volume === null || volume === undefined || volume === '') return null;
   const v = Number(volume);
   if (!Number.isFinite(v)) return null;
-  return Math.trunc(Math.min(1, Math.max(0, v)) * 1000 + 1e-6);
+  return Math.min(1, Math.max(0, v));
 }
 
-// YouTube reports volume as percent (0..100), possibly with decimals (52.6).
-function percentToMillis(percent) {
+// YouTube reports volume as percent (0..100), possibly with decimals (52.6461).
+function percentToVolume(percent) {
   const p = Number(percent);
   if (!Number.isFinite(p)) return null;
-  return volumeToMillis(p / 100);
+  return normalizeVolume(p / 100);
+}
+
+function sameVolume(a, b) {
+  return a !== null && b !== null && Math.abs(a - b) <= VOLUME_EPS;
 }
 
 // Runs in the page's JS world, where movie_player is reachable.
 function pageVolumeBridge() {
   const REPORT = 'ytmpris-volume-report';
-  // The logical slider volume. Do not read the media element: YouTube applies
-  // loudness normalization to it, so a 5% slider can make video.volume 0.026.
-  function readPercent(player) {
+  // YouTube's loudness / Stable Volume processing scales the media element away
+  // from the slider, so a 5% slider can make video.volume 0.026. That means
+  // "slider value" (logical) and video.volume (actual) are two different
+  // scales, and if MPRIS holds one while the element holds the other, every
+  // sync bounces between them (the 1ms blip). The calc layer below keeps a
+  // single logical scale everywhere: MPRIS always gets the slider value, and
+  // the element is pinned to that same value so there is nothing to fight over.
+  let scale = 1; // element volume per 1.0 of slider; learned as we observe
+
+  function currentVideo() {
+    return document.querySelector('video');
+  }
+  function readActual() {
+    const vid = currentVideo();
+    if (!vid) return null;
+    const v = Number(vid.volume);
+    return Number.isFinite(v) ? Math.min(1, Math.max(0, v)) : null;
+  }
+  // The logical slider value as percent (0..100), in the MPRIS scale.
+  function readSliderPercent(player) {
     if (player && typeof player.getVolume === 'function') {
       const v = Number(player.getVolume());
       if (Number.isFinite(v)) return v;
     }
     const panel = document.querySelector('.ytp-volume-panel[aria-valuenow]');
-    if (!panel || typeof panel.getAttribute !== 'function') return null;
-    const v = parseFloat(panel.getAttribute('aria-valuenow'));
-    return Number.isFinite(v) ? v : null;
+    if (panel && typeof panel.getAttribute === 'function') {
+      const v = parseFloat(panel.getAttribute('aria-valuenow'));
+      if (Number.isFinite(v)) return v;
+    }
+    // Last resort: recover the logical value from the media element. This is
+    // the calc layer the other way around (video.volume 0.026 -> slider 5%).
+    const actual = readActual();
+    if (actual === null || scale <= 0) return null;
+    return (actual / scale) * 100;
+  }
+  // Learn the element/slider ratio while the page is idle, so the fallback
+  // above can convert video.volume back into the logical slider value.
+  function observeScale(player) {
+    const logical = player && typeof player.getVolume === 'function'
+      ? Number(player.getVolume()) / 100 : null;
+    const actual = readActual();
+    if (logical === null || !Number.isFinite(logical) || logical <= 1e-6) return;
+    if (actual === null || actual <= 1e-6) return;
+    const s = actual / logical;
+    if (s >= 0.05 && s <= 2) scale = scale * 0.8 + s * 0.2;
+  }
+  // Pin the media element to the logical slider level so loudness / Stable
+  // Volume normalization cannot leave the real audio on a different scale
+  // than MPRIS reports.
+  function pinElement(logical) {
+    const vid = currentVideo();
+    if (!vid) return;
+    const v = Math.min(1, Math.max(0, logical));
+    const cur = Number(vid.volume);
+    if (Number.isFinite(cur) && Math.abs(cur - v) <= 1e-6) return;
+    vid.volume = v;
   }
   function report(player) {
-    const v = readPercent(player);
-    if (v !== null) window.dispatchEvent(new CustomEvent(REPORT, { detail: v }));
+    observeScale(player);
+    const v = readSliderPercent(player);
+    if (v !== null) {
+      window.dispatchEvent(new CustomEvent(REPORT, { detail: v }));
+      pinElement(v / 100);
+    }
   }
   window.addEventListener('ytmpris-set-volume', (e) => {
+    const volume = Number(e.detail);
+    if (!Number.isFinite(volume)) return;
+    const logical = Math.min(1, Math.max(0, volume));
+    const percent = logical * 100;
     const player = document.getElementById('movie_player');
-    if (!player || typeof player.setVolume !== 'function') return;
-    const millis = Math.min(1000, Math.max(0, Math.round(Number(e.detail))));
-    // setVolume takes percent, so 0.526 becomes 52.6 and keeps its 3 decimals.
-    const percent = millis / 10;
-    if (typeof player.getVolume === 'function') {
-      const current = Math.round(Number(player.getVolume()) * 10);
-      if (Math.abs(current - millis) <= 1) return;
+    if (player && typeof player.setVolume === 'function') {
+      let changed = true;
+      if (typeof player.getVolume === 'function') {
+        const current = Number(player.getVolume());
+        // 1e-4 percent is 1e-6 of the 0..1 volume, the same tolerance used above.
+        if (Number.isFinite(current) && Math.abs(current - percent) <= 1e-4) changed = false;
+      }
+      if (changed) player.setVolume(percent);
     }
-    player.setVolume(percent);
+    // The slider is set; now fix the element to the same logical value so
+    // Firefox's MPRIS write and YouTube's normalization agree on one scale.
+    pinElement(logical);
   });
   function hook() {
     const player = document.getElementById('movie_player');
@@ -93,9 +154,14 @@ function ensureBridge() {
   window.dispatchEvent(new CustomEvent('ytmpris-attach'));
 }
 
-function sendToHost(millis) {
+function sendToHost(volume) {
   try {
-    const sent = api.runtime.sendMessage({ type: 'volume', millis });
+    const sent = api.runtime.sendMessage({
+      type: 'volume',
+      volume,
+      // Legacy field for an older background/host; the new host prefers volume.
+      millis: Math.round(volume * 1000),
+    });
     if (sent && typeof sent.catch === 'function') sent.catch(() => {});
   } catch (e) {
     // Background page not ready yet; the next change will retry.
@@ -104,36 +170,38 @@ function sendToHost(millis) {
 
 function flushPageVolume() {
   sendTimer = null;
-  const millis = pending;
+  const volume = pending;
   pending = null;
-  if (millis === null) return;
+  if (volume === null) return;
   // The value may have been applied from MPRIS while the timer was pending.
   if (Date.now() < lockUntil) return;
-  if (expected !== null && Math.abs(millis - expected) <= 1) return;
-  expected = millis;
-  sendToHost(millis);
+  if (sameVolume(volume, expected)) return;
+  expected = volume;
+  sendToHost(volume);
 }
 
 // YouTube -> host: the page volume changed for a reason we did not cause.
 function onPageVolume(percent) {
-  const millis = percentToMillis(percent);
-  if (millis === null) return;
+  const volume = percentToVolume(percent);
+  if (volume === null) return;
   // First value on this page belongs to the site; adopt it without writing.
   if (!adopted) {
     adopted = true;
-    expected = millis;
+    expected = volume;
     return;
   }
   if (Date.now() < lockUntil) return;
-  if (expected !== null && Math.abs(millis - expected) <= 1) return;
-  pending = millis;
+  if (sameVolume(volume, expected)) return;
+  pending = volume;
   if (sendTimer) clearTimeout(sendTimer);
   sendTimer = setTimeout(flushPageVolume, SEND_DELAY_MS);
 }
 
 // Host -> YouTube: MPRIS changed externally (volume keys, mixer, another tool).
-function onHostVolume(millis) {
-  expected = millis;
+function onHostVolume(volume) {
+  const v = normalizeVolume(volume);
+  if (v === null) return;
+  expected = v;
   lockUntil = Date.now() + APPLY_LOCK_MS;
   if (sendTimer) {
     clearTimeout(sendTimer);
@@ -141,14 +209,20 @@ function onHostVolume(millis) {
     pending = null;
   }
   ensureBridge();
-  window.dispatchEvent(new CustomEvent(VOLUME_EVENT, { detail: millis }));
+  window.dispatchEvent(new CustomEvent(VOLUME_EVENT, { detail: v }));
 }
 
 api.runtime.onMessage.addListener((message) => {
   if (!message || message.type !== 'mpris-volume') return;
+  const volume = normalizeVolume(message.volume);
+  if (volume !== null) {
+    onHostVolume(volume);
+    return;
+  }
+  // Legacy push from an older background/host.
   const millis = Math.trunc(Number(message.millis));
   if (!Number.isFinite(millis) || millis < 0 || millis > 1000) return;
-  onHostVolume(millis);
+  onHostVolume(millis / 1000);
 });
 
 // Tell the background which tab should receive MPRIS updates.

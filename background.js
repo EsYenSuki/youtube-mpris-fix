@@ -11,10 +11,27 @@ let port = null;
 let reconnectTimer = null;
 const tabs = new Set();
 
+function validVolume(value) {
+  if (value === null || value === undefined || value === '') return null;
+  const volume = Number(value);
+  if (!Number.isFinite(volume) || volume < 0 || volume > 1) return null;
+  return volume;
+}
+
 function validMillis(value) {
+  if (value === null || value === undefined || value === '') return null;
   const millis = Math.trunc(Number(value));
   if (!Number.isFinite(millis) || millis < 0 || millis > 1000) return null;
   return millis;
+}
+
+// Prefer the exact volume; fall back to the legacy millis field.
+function volumeFrom(message) {
+  if (!message) return null;
+  const volume = validVolume(message.volume);
+  if (volume !== null) return volume;
+  const millis = validMillis(message.millis);
+  return millis === null ? null : millis / 1000;
 }
 
 function sendToTabs(message) {
@@ -47,9 +64,14 @@ function connect() {
   }
   port.onMessage.addListener((message) => {
     if (!message || message.type !== 'volume') return;
-    const millis = validMillis(message.millis);
-    if (millis === null) return;
-    sendToTabs({ type: 'mpris-volume', millis });
+    const volume = volumeFrom(message);
+    if (volume === null) return;
+    sendToTabs({
+      type: 'mpris-volume',
+      volume,
+      // Legacy field for an older content script.
+      millis: Math.round(volume * 1000),
+    });
   });
   port.onDisconnect.addListener(() => {
     port = null;
@@ -59,11 +81,16 @@ function connect() {
   return port;
 }
 
-function postVolume(millis) {
+function postVolume(volume) {
   const active = connect();
   if (!active) return;
   try {
-    active.postMessage({ type: 'set', millis });
+    active.postMessage({
+      type: 'set',
+      volume,
+      // Legacy field for an older native host.
+      millis: Math.round(volume * 1000),
+    });
   } catch (e) {
     port = null;
     scheduleReconnect();
@@ -78,8 +105,8 @@ api.runtime.onMessage.addListener((message, sender) => {
     return;
   }
   if (message.type === 'volume') {
-    const millis = validMillis(message.millis);
-    if (millis !== null) postVolume(millis);
+    const volume = volumeFrom(message);
+    if (volume !== null) postVolume(volume);
   }
 });
 
